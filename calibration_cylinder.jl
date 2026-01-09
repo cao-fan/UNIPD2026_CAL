@@ -351,7 +351,6 @@ function cost_with_A_b(x, p)
     return S, JtJ, Jtb
 end
 
-using Infiltrator
 
 function solve(data; max_iters=50)
     T_EB_data, x_data, initial_cylinder, initial_T_CE = data

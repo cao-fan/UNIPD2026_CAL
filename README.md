@@ -4,7 +4,7 @@ Open the terminal and cd to the installation folder, enter the Package Manager m
 
 > activate .
 
-Followed by:
+Then run 'instantiate' to install all the requirements:
 
 > instantiate
 

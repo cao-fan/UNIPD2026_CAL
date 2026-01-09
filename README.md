@@ -3,8 +3,11 @@ Install Julia 1.11.7
 Open the terminal and cd to the installation folder, enter the Package Manager mode by pressing ']', then run:
 
 > activate .
+
+Followed by:
+
 > instantiate
 
-Backslash to exit Package Manager mode and run:
+Backslash to exit Package Manager mode and then run:
 
-include("script.jl")
+> include("script.jl")

@@ -1,4 +1,4 @@
-Install Julia 1.11.7
+Install Julia 1.11.7(I recommend to install julia through (JuliaUp)[https://github.com/JuliaLang/juliaup])
 
 Open the terminal and cd to the installation folder and open the Julia REPL:
 

@@ -1,11 +1,7 @@
-Install Julia 1.11.7(I recommend to install julia through (JuliaUp)[https://github.com/JuliaLang/juliaup])
+Open the terminal in the project folder(alternatively one can """cd("<project folder>")""").
+Install Julia 1.11.7(I recommend to install julia through [JuliaUp](https://github.com/JuliaLang/juliaup))
 
-Open the terminal and cd to the installation folder and open the Julia REPL:
-
-> julia
-
-or if multiple versions of julia are installed:
-
+> juliaup add 1.11.7
 > julia +1.11.7
 
 Enter the Package Manager mode by pressing ']', then run:

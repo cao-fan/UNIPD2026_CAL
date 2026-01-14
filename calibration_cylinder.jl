@@ -1,9 +1,11 @@
 module CylinderCalibration
 
 using CSV, DelimitedFiles, StatsBase, ProgressBars
-using StaticArrays, LinearAlgebra, Rotations, LieGroups, Random, Manifolds
-using Enzyme
+using StaticArrays, LinearAlgebra, LieGroups, Random, Manifolds
+Random.seed!(123)
+using ForwardDiff, NonlinearSolve, PreallocationTools
 using GLMakie
+import Rotations as Rot
 
 function visualize_calibration_ex(T_EB_data, x_data, T_CE, cylinder, point_clouds)
     fig = Figure(size = (1200, 800))
@@ -180,7 +182,7 @@ function ellipseResidual(x, M , x0)
     return residual
 end
 
-function orthogonal_ransac_ellipse(points_2d;threshold=1.0,max_iters=5000, max_radius=20, min_radius=10,min_samples=4)
+function orthogonal_ransac_ellipse(points_2d;threshold=1.0,max_iters=6000, max_radius=20, min_radius=10,min_samples=4)
     I = axes(points_2d,1)
     N = size(points_2d,1)
     best_score = 0
@@ -227,7 +229,7 @@ function affine(R::AbstractMatrix{T},t::AbstractVector{T}) where T
     return SMatrix{4,4}(M)
 end
 
-function prepare_data(pcs,scan_coords; threshold=1.)
+function prepare_data(pcs,scan_coords; threshold=0.5)
     # Shuffle the data
     shuffle_idxs = randperm(length(pcs))
     shuffled_pcs = pcs[shuffle_idxs]
@@ -241,7 +243,7 @@ function prepare_data(pcs,scan_coords; threshold=1.)
         pc = shuffled_pcs[i]
         row = shuffled_scan_coords[i,:]
         # Rotations.jl uses intrinsic Euler, we use extrinsic XYZ
-        R = SMatrix{3,3}(RotZYX(deg2rad.(row[6:-1:4])...))
+        R = SMatrix{3,3}(Rot.RotZYX(deg2rad.(row[6:-1:4])...))
         t = SVector{3}(row[1:3])
         T_EB = affine(R,t)
 
@@ -271,138 +273,161 @@ end
 # Reparametrize c as: c=(c+dc) - dot(c+dc,v)v
 
 function normalize_v(v)
+    v = SVector{3}(v)
     return v/norm(v)
 end
 
 function remove_v_component(x,v)
+    x = SVector{3}(x)
+    v = SVector{3}(v)
     return x - dot(x,v)*v
 end
 
 function project_point(T_EB, T_CE, x::AbstractVector{T}) where T
     x_h = SVector{4}(x[1], x[2], x[3], one(T))
-    y_h = T_EB * (T_CE * x_h)
-    return SVector{3}(y_h[1:3])
+    y_h = T_EB * T_CE * x_h
+    return SVector{3}(@view(y_h[1:3]))
 end
 
 function get_tangent_basis(v)
     v = SVector{3}(v)
-    F = eigen(I-v*transpose(v))
-    e1 = F.vectors[:,2]
-    e2 = F.vectors[:,3]
+    F = eigen(Symmetric(I-v*transpose(v)))
+    e1 = @view F.vectors[:,2]
+    e2 = @view F.vectors[:,3]
     return SVector{3}(e1),SVector(e2)
 end
 
 function distance_from_cylinder(cylinder, x)
-    v = cylinder[1:3]
-    c = cylinder[4:6]
+    v = @view cylinder[1:3]
+    v = SVector{3}(v)
+    c = @view cylinder[4:6]
+    c = SVector{3}(c)
     r = cylinder[7]
 
+    x = SVector{3}(x)
     u = x - c
     u_perp = u - dot(u, v) * v
     return norm(u_perp) - r
 end
 
-function residual(x,p)
-    T_EB, point, cylinder, T_CE, e1, e2 = p
+function _hat!(cache, v::AbstractVector{P}) where P
+    # 1 4 7
+    # 2 5 8
+    # 3 6 9
+    G1 = SMatrix{3,3}(0,0,0,0,0,1.0,0,-1.0,0)
+    G2 = SMatrix{3,3}(0,0,-1.0,0,0,0,1.0,0,0)
+    G3 = SMatrix{3,3}(0,1.0,0,-1.0,0,0,0,0,0)
 
-    v = cylinder[1:3]
-    c = cylinder[4:6]
+    T = cache
+    v = SVector{6}(v)
+    T .= zero(P)
+    θ = @view v[1:3]
+    ρ = @view v[4:6]
+    T[1:3,1:3] = θ[1]*G1 + θ[2]*G2 + θ[3]*G3
+    T[1:3,4] = ρ
+    return T
+end
+
+function Exp!(SE3, exp_cache, hat_cache, x)
+    _hat!(hat_cache,x)
+    exp!(SE3, exp_cache, hat_cache)
+    return nothing
+end
+
+function residual(x,p)
+    T_EB, point, cylinder, T_CE, exp_cache, hat_cache, SE3, e1, e2 = p
+
+    v = @view cylinder[1:3]
+    c = @view cylinder[4:6]
     r = cylinder[7]
 
-    dRdt = x[1:6] #6
-    dv = x[7:8] #2
-    dc = x[9:10] #2
+    dRdt = @view x[1:6] #6
+    dv   = @view x[7:8] #2
+    dc   = @view x[9:10] #2
 
-    SE3 = SpecialEuclideanGroup(3)
-    se3 = LieAlgebra(SE3)
-    perturb = exp(SE3, hat(se3, dRdt))
-    new_T_CE = compose(SE3, T_CE, perturb)
-
-    new_v = normalize_v(v + dv[1]*e1 + dv[2]*e2) # by construction satisfied dot(v,v)=1
-    new_c = remove_v_component(c + dc[1]*e1 + dc[2]*e2, v) # by construction satisfied dot(c,v)=0
-    new_cylinder = vcat(new_v,new_c,r)#vcat(new_v,new_c,new_r)
-
+    
+    Exp!(SE3, exp_cache, hat_cache, dRdt)
+    T_CE = SMatrix{4,4}(T_CE)
+    exp_cache = SMatrix{4,4}(exp_cache)
+    new_T_CE = T_CE * exp_cache
+    new_v = normalize_v(v + dv[1]*e1 + dv[2]*e2) # by construction satisfies dot(v,v)=1
+    new_c = remove_v_component(c + dc[1]*e1 + dc[2]*e2, v) # by construction satisfies dot(c,v)=0
+    new_cylinder = vcat(new_v, new_c, r)
     projected_point = project_point(T_EB,new_T_CE,point)
     return distance_from_cylinder(new_cylinder, projected_point)
 end
 
-function cost_with_A_b(x, p)
-    T_EB_data, x_data, cylinder, T_CE, e1, e2 = p
-    dx = zero(x)
-    S = 0.0
-    JtJ = zeros(10,10)
-    Jtb = zeros(10)
-    N = size(T_EB_data,1)
+function res_vec!(y,x,p)
+    T_EB_data, x_data, cylinder, T_CE, hat_cache, exp_cache, SE3, e1, e2 = p
     
+    hat_cache = get_tmp(hat_cache,x)
+    exp_cache = get_tmp(exp_cache,x)
+    y = get_tmp(y,x)
+    
+    k = 0
     for i in eachindex(T_EB_data)
-        T_EB = T_EB_data[i]
-        measurements = x_data[i]
-        M = size(measurements,1)
-        for point in measurements
-            res_p = (T_EB, point, cylinder, T_CE, e1, e2)
-            dx .= 0.0 #zero gradient since it's accumulated
-            resid = Enzyme.autodiff(Enzyme.ReverseWithPrimal, residual, Active, Duplicated(x,dx), Const(res_p))[2]
-            S += resid^2 / N / M
-            J = transpose(dx)
-            JtJ += transpose(J)*J / N / M
-            Jtb += transpose(J)*resid / N / M
+        points = x_data[i]
+        for j in eachindex(points)
+            res_p = (T_EB_data[i], points[j], cylinder, T_CE, exp_cache, hat_cache, SE3, e1, e2)
+            k+=1
+            y[k] = residual(x,res_p)
         end
     end
-    return S, JtJ, Jtb
+    return y
 end
 
-
-function solve(data; max_iters=50)
-    T_EB_data, x_data, initial_cylinder, initial_T_CE = data
-
-    cylinder = initial_cylinder
-    cylinder[1:3] = normalize_v(cylinder[1:3])
-    cylinder[4:6] = remove_v_component(cylinder[4:6], cylinder[1:3])
-    T_CE = initial_T_CE
-
+function solve(data;max_iters=50)
     SE3 = SpecialEuclideanGroup(3)
-    se3 = LieAlgebra(SE3)
-    dx = zeros(10)
-    old_loss = Inf
-    lambda = 1e-3
-    for i in 1:max_iters
-        v = cylinder[1:3]
-        c = cylinder[4:6]
-        r = cylinder[7]
+    
+    T_EB_data,x_data,cylinder,T_CE = data
+    N = sum(x->size(x,1),x_data)
+    hat_cache = DiffCache(zeros(4,4),10)
+    exp_cache = DiffCache(zeros(4,4),10)
+    
+    
+    p0 = zeros(10)
+    e1, e2 = get_tangent_basis(cylinder[1:3])
+    p = (T_EB_data, x_data, cylinder, T_CE, hat_cache, exp_cache, SE3, e1, e2)
+    prob = NonlinearLeastSquaresProblem(
+        NonlinearFunction(res_vec!, resid_prototype = zeros(N)), p0, p,
+        maxiters=1
+    )
+    solver = GaussNewton(
+        autodiff=NonlinearSolve.AutoForwardDiff(), #chunksize=size(p0,1)
+        linesearch=NonlinearSolve.LineSearch.BackTracking(autodiff=NonlinearSolve.AutoForwardDiff()),#chunksize=size(p0,1)
+        linsolve=CholeskyFactorization()
+    )
+    sol = NonlinearSolve.solve(prob, solver)
 
-        e1, e2 = get_tangent_basis(v)
-        # dx is the vector of perturbations in the tangent space
-        p = (T_EB_data, x_data, cylinder, T_CE, e1, e2)
-        obj_val, JtJ, Jtb = cost_with_A_b(dx,p)
-        if obj_val < old_loss
-            lambda /= 2
-        else
-            lambda *= 3
-        end
-        Δdx = (JtJ+lambda*I) \ -Jtb
-        
-        dSE3 = Δdx[1:6] #6
-        dv   = Δdx[7:8] #2
-        dc   = Δdx[9:10] #2
-        @info "Iteration: $i" obj_val norm(Δdx)
-        @debug "dSE3" dSE3[1:3] dSE3[4:6]
-        @debug "dv,dc" dv dc
-        # Update rigid transformation T_CE
-        T_CE = compose(SE3, T_CE, exp(SE3, hat(se3, dSE3)))
-        @debug "T_CE" vee(se3,log(SE3, T_CE))
-        @debug "v,c,r" v c r
+    for i in 1:max_iters
+        e1, e2 = get_tangent_basis(cylinder[1:3])
+        p = (T_EB_data, x_data, cylinder, T_CE, hat_cache, exp_cache, SE3, e1, e2)
+        prob = remake(prob; u0=p0,p=p)
+        # 1 Newton step
+        sol = NonlinearSolve.solve(prob, solver)
+        # Update T_CE
+        dRdt = @view sol.u[1:6]
+        _exp_cache = get_tmp(exp_cache,sol.u)
+        _hat_cache = get_tmp(hat_cache,sol.u)
+        Exp!(SE3, _exp_cache, _hat_cache, dRdt)
+        T_CE = T_CE*_exp_cache
         # Update cylinder
-        v = normalize_v(v + dv[1]*e1 + dv[2]*e2)
-        c = remove_v_component(c + dc[1]*e1 + dc[2]*e2, v)
-        cylinder = vcat(v,c,r)
-        if norm(Δdx) < 1e-4
+        dv   = @view sol.u[7:8]
+        v = @view cylinder[1:3]
+        v = normalize_v(v + dv[1]*e1 + dv[2]*e2) # by construction satisfies dot(v,v)=1
+        dc   = @view sol.u[9:10]
+        c = @view cylinder[4:6]
+        c = remove_v_component(c + dc[1]*e1 + dc[2]*e2, v) # by construction satisfies dot(c,v)=0
+        cylinder = vcat(v,c,cylinder[end])
+
+        @info "Loss $(norm(sol.resid))"
+        if norm(sol.u) < 1e-4
             break
         end
-        old_loss = obj_val
     end
     return T_CE, cylinder
 end
 
-export load_2d_scans, prepare_data, cost_with_A_b, solve
+export load_2d_scans, prepare_data, cost, residual, res_vec!
 
 end

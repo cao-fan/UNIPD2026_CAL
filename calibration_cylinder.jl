@@ -59,7 +59,7 @@ function load_2d_scans(root_folder)
         N = size(scan,1)
         x = zeros(N)
         lower_bound = -floor(N/2)
-        y = (lower_bound+N-1:-1:lower_bound) .* PIXEL2MM / BINNING
+        y = (lower_bound:lower_bound+N-1) .* PIXEL2MM / BINNING
         SVector{3,Float64}.(x[z_not_nan],y[z_not_nan],z[z_not_nan])
     end
     calib_dir = joinpath(root_folder,"calibration")
@@ -429,5 +429,6 @@ function solve(data;max_iters=50)
 end
 
 export load_2d_scans, prepare_data, cost, residual, res_vec!
+
 
 end
